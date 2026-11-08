@@ -1,0 +1,78 @@
+name: Build store app
+
+on:
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: "Store slug (e.g. eret)"
+        required: true
+      name:
+        description: "App name shown on the phone"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ inputs.slug }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SLUG: ${{ inputs.slug }}
+      APPNAME: ${{ inputs.name }}
+      GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+      KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+      HOOK_URL: ${{ secrets.BUILD_HOOK_URL }}
+      HOOK_SECRET: ${{ secrets.BUILD_HOOK_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate inputs
+        run: |
+          echo "$SLUG" | grep -Eq '^[a-z0-9][a-z0-9-]{1,39}$' || { echo "bad slug"; exit 1; }
+          [ -n "$APPNAME" ] && [ ${#APPNAME} -le 40 ] || { echo "bad name"; exit 1; }
+          [ -n "$GOOGLE_SERVICES_JSON" ] || { echo "missing GOOGLE_SERVICES_JSON secret"; exit 1; }
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.35.6"
+          channel: stable
+          cache: true
+
+      - name: Accept Android licenses
+        run: yes | flutter doctor --android-licenses || true
+
+      - name: Python deps
+        run: pip install pillow
+
+      - name: Build APK
+        run: python3 tool/build.py "$SLUG" "$APPNAME"
+
+      - name: Publish to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="app-$SLUG"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "Store app for $SLUG"
+          gh release upload "$TAG" "out/$SLUG.apk" --clobber
+
+      - name: Notify platform (success)
+        if: env.HOOK_URL != ''
+        run: |
+          curl -fsS -X POST "$HOOK_URL" -H "content-type: application/json" -H "x-hook-secret: $HOOK_SECRET" \
+            -d "{\"slug\":\"$SLUG\",\"ok\":true}" || true
+
+      - name: Notify platform (failure)
+        if: failure() && env.HOOK_URL != ''
+        run: |
+          curl -fsS -X POST "$HOOK_URL" -H "content-type: application/json" -H "x-hook-secret: $HOOK_SECRET" \
+            -d "{\"slug\":\"$SLUG\",\"ok\":false}" || true
